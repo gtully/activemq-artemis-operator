@@ -125,6 +125,10 @@ test-mk: manifests generate fmt vet envtest ## Run tests against minikube with l
 test-mk-do: manifests generate fmt vet envtest generate-deploy ## Run tests against minikube with deployed operator(do)
 	DEPLOY_OPERATOR=true USE_EXISTING_CLUSTER=true ENABLE_WEBHOOKS=false go test  ./controllers/... -test.timeout=40m -ginkgo.slow-spec-threshold=30s -ginkgo.fail-fast -ginkgo.v -ginkgo.label-filter="do"
 
+# useful for CI smoke
+test-mk-do-fast: manifests generate fmt vet envtest generate-deploy ## Run tests against minikube with deployed operator(do) and exclude slow
+	DEPLOY_OPERATOR=true USE_EXISTING_CLUSTER=true ENABLE_WEBHOOKS=false go test  ./controllers/... -test.timeout=40m -ginkgo.slow-spec-threshold=30s -ginkgo.fail-fast -ginkgo.v -ginkgo.label-filter="do && !slow"
+
 ##@ Build
 
 build: generate fmt vet manifests ## Build manager binary.

@@ -1983,6 +1983,20 @@ func configureLivenessProbe(container *corev1.Container, probeFromCr *corev1.Pro
 	return livenessProbe
 }
 
+var command = []string{
+	"/bin/bash",
+	"-c",
+	"/opt/amq/bin/readinessProbe.sh",
+}
+
+var betterCommand = []string{
+	"/bin/bash",
+	"-c",
+	"/opt/amq/bin/readinessProbe.sh",
+	"1", // retries/count - so we get fast feedback and can configure via the Probe
+	// "1", sleep seconds not applicable with 1 retry
+}
+
 func configureReadinessProbe(container *corev1.Container, probeFromCr *corev1.Probe) *corev1.Probe {
 
 	var readinessProbe *corev1.Probe = container.ReadinessProbe
@@ -1995,32 +2009,37 @@ func configureReadinessProbe(container *corev1.Container, probeFromCr *corev1.Pr
 	if probeFromCr != nil {
 		applyNonDefaultedValues(readinessProbe, probeFromCr)
 		if probeFromCr.Exec == nil && probeFromCr.HTTPGet == nil && probeFromCr.TCPSocket == nil {
-			//add the default readiness check if none
-			clog.V(1).Info("Using user provided readiness Probe")
-			readinessProbe.ProbeHandler = corev1.ProbeHandler{
-				Exec: &corev1.ExecAction{
-					Command: []string{
-						"/bin/bash",
-						"-c",
-						"/opt/amq/bin/readinessProbe.sh",
+			clog.V(1).Info("adding default handler to user provided readiness Probe")
+
+			// respect existing command where already deployed
+			if readinessProbe.ProbeHandler.Exec != nil && reflect.DeepEqual(readinessProbe.ProbeHandler.Exec.Command, command) {
+				// leave it be so we don't force a reconcile
+			} else {
+				// upgrade to betterCommand!
+				readinessProbe.ProbeHandler = corev1.ProbeHandler{
+					Exec: &corev1.ExecAction{
+						Command: betterCommand,
 					},
-				},
+				}
 			}
 		} else {
 			readinessProbe.ProbeHandler = probeFromCr.ProbeHandler
 		}
 	} else {
-		clog.V(1).Info("Creating Default readiness Probe")
+		clog.V(1).Info("vreating default readiness Probe")
 		readinessProbe.InitialDelaySeconds = defaultLivenessProbeInitialDelay
 		readinessProbe.TimeoutSeconds = 5
-		readinessProbe.ProbeHandler = corev1.ProbeHandler{
-			Exec: &corev1.ExecAction{
-				Command: []string{
-					"/bin/bash",
-					"-c",
-					"/opt/amq/bin/readinessProbe.sh",
+
+		// respect existing command where already deployed
+		if readinessProbe.ProbeHandler.Exec != nil && reflect.DeepEqual(readinessProbe.ProbeHandler.Exec.Command, command) {
+			// leave it be so we don't force a reconcile
+		} else {
+			// upgrade to betterCommand!
+			readinessProbe.ProbeHandler = corev1.ProbeHandler{
+				Exec: &corev1.ExecAction{
+					Command: betterCommand,
 				},
-			},
+			}
 		}
 	}
 

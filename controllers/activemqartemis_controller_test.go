@@ -3096,6 +3096,11 @@ var _ = Describe("artemis controller", func() {
 			By("By creating a crd without Liveness Probe")
 			ctx := context.Background()
 			crd := generateArtemisSpec(defaultNamespace)
+
+			// whack test defaults
+			crd.Spec.DeploymentPlan.ReadinessProbe = nil
+			crd.Spec.DeploymentPlan.LivenessProbe = nil
+
 			crd.Spec.AdminUser = "admin"
 			crd.Spec.AdminPassword = "password"
 			createdCrd := &brokerv1beta1.ActiveMQArtemis{}
@@ -4494,6 +4499,64 @@ var _ = Describe("artemis controller", func() {
 		})
 	})
 
+	Context("time to ready", func() {
+		It("expect ok ready is fast", func() {
+
+			By("By creating a crd without persistence")
+			ctx := context.Background()
+			crd := generateArtemisSpec(defaultNamespace)
+
+			crd.Spec.DeploymentPlan.LivenessProbe = &corev1.Probe{
+				InitialDelaySeconds: 1,
+				PeriodSeconds:       2,
+			}
+			crd.Spec.DeploymentPlan.ReadinessProbe = &corev1.Probe{
+				InitialDelaySeconds: 1,
+				PeriodSeconds:       2,
+			}
+
+			// about 10s to 1, 30s for 5 on minikube
+			deploymentSize := 1
+			crd.Spec.DeploymentPlan.Size = int32(deploymentSize)
+			crd.Spec.DeploymentPlan.PersistenceEnabled = true
+
+			Expect(k8sClient.Create(ctx, &crd)).Should(Succeed())
+
+			createdSs := &appsv1.StatefulSet{}
+			key := types.NamespacedName{Name: namer.CrToSS(crd.Name), Namespace: defaultNamespace}
+
+			if os.Getenv("USE_EXISTING_CLUSTER") == "true" {
+
+				By("Checking ready on SS")
+				Eventually(func(g Gomega) {
+
+					g.Expect(k8sClient.Get(ctx, key, createdSs)).Should(Succeed())
+					g.Expect(createdSs.Status.ReadyReplicas).Should(BeEquivalentTo(deploymentSize))
+				}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
+
+				createdCrd := &brokerv1beta1.ActiveMQArtemis{}
+				brokerKey := types.NamespacedName{Name: crd.Name, Namespace: crd.Namespace}
+
+				By("verifying started via Status")
+				Eventually(func(g Gomega) {
+					g.Expect(k8sClient.Get(ctx, brokerKey, createdCrd)).Should(Succeed())
+					g.Expect(len(createdCrd.Status.PodStatus.Ready)).Should(BeEquivalentTo(deploymentSize))
+					g.Expect(meta.IsStatusConditionTrue(createdCrd.Status.Conditions, brokerv1beta1.ConfigAppliedConditionType)).Should(BeTrue())
+					g.Expect(meta.IsStatusConditionTrue(createdCrd.Status.Conditions, brokerv1beta1.DeployedConditionType)).Should(BeTrue())
+					g.Expect(meta.IsStatusConditionTrue(createdCrd.Status.Conditions, common.ReadyConditionType)).Should(BeTrue())
+
+				}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
+
+			}
+			// cleanup
+			Expect(k8sClient.Delete(ctx, &crd)).Should(Succeed())
+			By("check it has gone")
+			Eventually(func() bool {
+				return checkCrdDeleted(crd.ObjectMeta.Name, defaultNamespace, &crd)
+			}, timeout, interval).Should(BeTrue())
+		})
+	})
+
 	Context("With deployed controller - acceptor", func() {
 
 		It("Add acceptor via update", func() {
@@ -5547,6 +5610,7 @@ var _ = Describe("artemis controller", func() {
 		randString := nameFromTest()
 		crd := generateOriginalArtemisSpec(defaultNamespace, "br-"+randString)
 
+		crd.Spec.DeploymentPlan.ReadinessProbe = nil
 		crd.Spec.AdminUser = "admin"
 		crd.Spec.AdminPassword = "secret"
 		crd.Spec.DeploymentPlan.LivenessProbe = &corev1.Probe{
@@ -6087,9 +6151,23 @@ var _ = Describe("artemis controller", func() {
 
 })
 
-func generateArtemisSpec(namespace string) brokerv1beta1.ActiveMQArtemis {
-
+func newArtemisSpecWithFastPropes() brokerv1beta1.ActiveMQArtemisSpec {
 	spec := brokerv1beta1.ActiveMQArtemisSpec{}
+
+	// sensible fast defaults for tests against existing cluster
+	spec.DeploymentPlan.LivenessProbe = &corev1.Probe{
+		InitialDelaySeconds: 1,
+		PeriodSeconds:       2,
+	}
+	spec.DeploymentPlan.ReadinessProbe = &corev1.Probe{
+		InitialDelaySeconds: 1,
+		PeriodSeconds:       2,
+	}
+
+	return spec
+}
+
+func generateArtemisSpec(namespace string) brokerv1beta1.ActiveMQArtemis {
 
 	toCreate := brokerv1beta1.ActiveMQArtemis{
 		TypeMeta: metav1.TypeMeta{
@@ -6100,7 +6178,7 @@ func generateArtemisSpec(namespace string) brokerv1beta1.ActiveMQArtemis {
 			Name:      nameFromTest(),
 			Namespace: namespace,
 		},
-		Spec: spec,
+		Spec: newArtemisSpecWithFastPropes(),
 	}
 
 	return toCreate
@@ -6108,7 +6186,7 @@ func generateArtemisSpec(namespace string) brokerv1beta1.ActiveMQArtemis {
 
 func generateOriginalArtemisSpec(namespace string, name string) *brokerv1beta1.ActiveMQArtemis {
 
-	spec := brokerv1beta1.ActiveMQArtemisSpec{}
+	spec := newArtemisSpecWithFastPropes()
 
 	toCreate := brokerv1beta1.ActiveMQArtemis{
 		TypeMeta: metav1.TypeMeta{
