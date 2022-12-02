@@ -158,7 +158,7 @@ func setUpEnvTest() {
 	createControllerManagerForSuite()
 }
 
-//Set up test-proxy for external http requests
+// Set up test-proxy for external http requests
 func setUpTestProxy() {
 
 	var err error
@@ -166,6 +166,28 @@ func setUpTestProxy() {
 	var testProxyNodePort int32 = 30128
 	var testProxyDeploymentReplicas int32 = 1
 	testProxyLabels := map[string]string{"app": "test-proxy"}
+
+	customConfig := corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "ConfigMap",
+			APIVersion: "k8s.io.api.core.v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "squid-conf",
+			Namespace: defaultNamespace,
+		},
+		Data: map[string]string{"squid.conf": `http_port 3128
+		 acl all src all
+		 http_access allow all
+		 pid_filename   none
+		 logfile_rotate 0
+		 access_log     stdio:/dev/stdout
+		 cache_log      stdio:/dev/stderr`,
+		},
+	}
+
+	err = k8sClient.Create(ctx, &customConfig)
+	Expect(err != nil || errors.IsConflict(err))
 
 	testProxyDeployment := appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
@@ -190,6 +212,35 @@ func setUpTestProxy() {
 								{
 									ContainerPort: testProxyPort,
 									Protocol:      "TCP",
+								},
+							},
+							/* not necessary at the moment, image defaults are fine
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "squid-conf",
+									MountPath: "/etc/squid/squid.conf",
+									SubPath:   "squid.conf",
+									ReadOnly:  true,
+								},
+							},
+							*/
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "squid-conf",
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: "squid-conf",
+									},
+									Items: []corev1.KeyToPath{
+										{
+											Key:  "squid.conf",
+											Path: "squid.conf",
+										},
+									},
 								},
 							},
 						},
@@ -253,6 +304,15 @@ func cleanUpTestProxy() {
 	}
 
 	err = k8sClient.Delete(ctx, &testProxyService)
+	Expect(err != nil || errors.IsNotFound(err))
+
+	customConfig := corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "squid-conf",
+			Namespace: defaultNamespace,
+		},
+	}
+	err = k8sClient.Delete(ctx, &customConfig)
 	Expect(err != nil || errors.IsNotFound(err))
 }
 
@@ -372,8 +432,6 @@ func setUpRealOperator() {
 	Expect(err).To(Succeed(), "failed to install operator")
 }
 
-//Deploy operator resources
-//TODO: provide 'watch all namespaces' option
 func installOperator() error {
 	logf.Log.Info("#### Installing Operator ####")
 	for _, res := range oprRes {
