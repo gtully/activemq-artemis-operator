@@ -15,5 +15,7 @@ resources:
 - broker_activemqartemisscaledown_v2alpha1_cr.yaml
 - broker_activemqartemisscaledown_v1beta1_cr.yaml
 
+- broker.amq.io_v1beta1_provision.yaml
+- broker.amq.io_v1beta1_provisionapplication.yaml
 #+kubebuilder:scaffold:manifestskustomizesamples
 

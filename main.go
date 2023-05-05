@@ -23,8 +23,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/artemiscloud/activemq-artemis-operator/version"
 	"github.com/go-logr/logr"
+
+	"github.com/artemiscloud/activemq-artemis-operator/version"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -252,6 +253,20 @@ func main() {
 		log.Info("NOT Setting up webhook functions", "ENABLE_WEBHOOKS", enableWebhooks)
 	}
 
+	if err = (&controllers.ProvisionReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		log.Error(err, "unable to create controller", "controller", "Provision")
+		os.Exit(1)
+	}
+	if err = (&controllers.ProvisionApplicationReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		log.Error(err, "unable to create controller", "controller", "ProvisionApplication")
+		os.Exit(1)
+	}
 	//+kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

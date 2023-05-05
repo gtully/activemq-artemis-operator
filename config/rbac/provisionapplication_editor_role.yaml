@@ -1,0 +1,24 @@
+# permissions for end users to edit provisionapplications.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: provisionapplication-editor-role
+rules:
+- apiGroups:
+  - broker.amq.io.amq.io
+  resources:
+  - provisionapplications
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - broker.amq.io.amq.io
+  resources:
+  - provisionapplications/status
+  verbs:
+  - get

@@ -1,0 +1,6 @@
+apiVersion: broker.amq.io.amq.io/v1beta1
+kind: Provision
+metadata:
+  name: provision-sample
+spec:
+  # Add fields here

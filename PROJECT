@@ -152,4 +152,22 @@ resources:
     defaulting: true
     validation: true
     webhookVersion: v1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: amq.io
+  group: broker.amq.io
+  kind: Provision
+  path: github.com/artemiscloud/activemq-artemis-operator/api/v1beta1
+  version: v1beta1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: amq.io
+  group: broker.amq.io
+  kind: ProvisionApplication
+  path: github.com/artemiscloud/activemq-artemis-operator/api/v1beta1
+  version: v1beta1
 version: "3"
