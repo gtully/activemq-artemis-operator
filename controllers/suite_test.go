@@ -514,6 +514,9 @@ func createControllerManager(disableMetrics bool, watchNamespace string) {
 	k8Manager, err = ctrl.NewManager(restConfig, mgrOptions)
 	Expect(err).ToNot(HaveOccurred())
 
+	mgrKs8Client := k8Manager.GetClient()
+	common.SetK8sClient(&mgrKs8Client)
+
 	brokerReconciler = NewActiveMQArtemisReconciler(k8Manager, ctrl.Log, isOpenshift)
 
 	if err = brokerReconciler.SetupWithManager(k8Manager); err != nil {
@@ -791,6 +794,9 @@ var _ = BeforeSuite(func() {
 	// force isLocalOnly=false check from artemis reconciler such that scale down controller will create
 	// role binding to service account for the drainer pod
 	os.Setenv("OPERATOR_WATCH_NAMESPACE", "SomeValueToCauesEqualitytoFailInIsLocalSoDrainControllerSortsCreds")
+
+	// pulled from service account when on a pod
+	os.Setenv("OPERATOR_NAMESPACE", defaultNamespace)
 
 	var err error
 	currentDir, err = os.Getwd()

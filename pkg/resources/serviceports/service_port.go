@@ -27,6 +27,13 @@ func GetDefaultPorts() *[]corev1.ServicePort {
 			TargetPort:  intstr.FromInt(int(8161)),
 		},
 		{
+			Name:        "jolokia",
+			Protocol:    "TCP",
+			Port:        8778,
+			AppProtocol: &appProtocolHTTP,
+			TargetPort:  intstr.FromInt(int(8778)),
+		},
+		{
 			Name:       "all",
 			Protocol:   "TCP",
 			Port:       61616,

@@ -8,7 +8,11 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/artemiscloud/activemq-artemis-operator/pkg/utils/common"
 )
+
+const JOLOKIA_AGENT_PORT = "8778"
 
 type IData interface {
 	Print()
@@ -49,10 +53,22 @@ type Jolokia struct {
 	user       string
 	password   string
 	protocol   string
+	restricted bool
 }
 
 func NewJolokia(_ip string, _port string, _path string, _user string, _password string) *Jolokia {
 	return GetJolokia(_ip, _port, _path, _user, _password, "http")
+}
+
+func GetRestrictedJolokia(_ip string, _port string, _path string) *Jolokia {
+	j := Jolokia{
+		ip:         _ip,
+		port:       _port,
+		jolokiaURL: _ip + ":" + _port + _path,
+		protocol:   "https",
+		restricted: true,
+	}
+	return &j
 }
 
 func GetJolokia(_ip string, _port string, _path string, _user string, _password string, _protocol string) *Jolokia {
@@ -93,6 +109,13 @@ func (j *Jolokia) getClient() *http.Client {
 		httpClientTransport.TLSClientConfig = &tls.Config{
 			InsecureSkipVerify: true,
 			ServerName:         j.ip,
+		}
+		if j.restricted {
+			httpClientTransport.TLSClientConfig.InsecureSkipVerify = false
+			httpClientTransport.TLSClientConfig.GetClientCertificate = common.GetOperatorClientCertificate
+		}
+		if rootCas, err := common.GetRootCAs(); err == nil {
+			httpClientTransport.TLSClientConfig.RootCAs = rootCas
 		}
 	}
 

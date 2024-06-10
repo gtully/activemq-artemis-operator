@@ -546,6 +546,9 @@ spec:
         name: ""
         version: apps/v1
       specDescriptors:
+      - description: Restricted deployment, mtls jolokia agent with RBAC
+        displayName: Restricted
+        path: Restricted
       - description: Specifies the acceptor configuration
         displayName: Acceptors
         path: acceptors

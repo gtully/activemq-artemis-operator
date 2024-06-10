@@ -253,6 +253,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	mgrKs8Client := mgr.GetClient()
+	common.SetK8sClient(&mgrKs8Client)
 	brokerReconciler := controllers.NewActiveMQArtemisReconciler(
 		mgr,
 		ctrl.Log.WithName("ActiveMQArtemisReconciler"),

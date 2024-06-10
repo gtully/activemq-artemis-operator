@@ -45,6 +45,9 @@ spec:
           spec:
             description: ActiveMQArtemisSpec defines the desired state of ActiveMQArtemis
             properties:
+              Restricted:
+                description: Restricted deployment, mtls jolokia agent with RBAC
+                type: boolean
               acceptors:
                 description: Specifies the acceptor configuration
                 items:
