@@ -79,6 +79,32 @@ rules:
 - apiGroups:
   - broker.amq.io
   resources:
+  - activemqartemisapps
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - broker.amq.io
+  resources:
+  - activemqartemisapps/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - broker.amq.io
+  resources:
+  - activemqartemisapps/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - broker.amq.io
+  resources:
   - activemqartemises
   verbs:
   - create
@@ -150,6 +176,32 @@ rules:
   - broker.amq.io
   resources:
   - activemqartemissecurities/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - broker.amq.io
+  resources:
+  - activemqartemisservices
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - broker.amq.io
+  resources:
+  - activemqartemisservices/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - broker.amq.io
+  resources:
+  - activemqartemisservices/status
   verbs:
   - get
   - patch
