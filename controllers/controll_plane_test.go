@@ -21,7 +21,10 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	cmv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
@@ -36,6 +39,7 @@ import (
 
 	brokerv1beta1 "github.com/artemiscloud/activemq-artemis-operator/api/v1beta1"
 	"github.com/artemiscloud/activemq-artemis-operator/pkg/utils/common"
+	"github.com/artemiscloud/activemq-artemis-operator/pkg/utils/namer"
 )
 
 var _ = Describe("minimal", func() {
@@ -141,11 +145,19 @@ var _ = Describe("minimal", func() {
 			})
 
 			crd.Spec.Restricted = common.NewTrue()
+			customImage := // "ac672dd8e55c"
+				"quay.io/gtully/artemis/34"
+			// "localhost/artemiscloud/activemq-artemis-broker-kubernetes:1.0.34"
+			crd.Spec.DeploymentPlan.Image = customImage
+			crd.Spec.DeploymentPlan.InitImage = customImage
 
 			// how the jdk command line can be configured or modified
 			crd.Spec.Env = []corev1.EnvVar{
-				{Name: "JDK_JAVA_OPTIONS", Value: "-XshowSettings:system -Xlog:os+container=trace -DordinalPropForDoubleO=${STATEFUL_SET_ORDINAL}${STATEFUL_SET_ORDINAL}7"},
-				{Name: "JAVA_ARGS_APPEND", Value: "-DordinalProp=${STATEFUL_SET_ORDINAL}"},
+				{Name: "JDK_JAVA_OPTIONS", Value: "-Djavax.net.debug=ssl -Djava.security.debug=logincontext"},
+				//{Name: "JAVA_ARGS_APPEND", Value: "-DordinalProp=${STATEFUL_SET_ORDINAL}"},
+			}
+			crd.Spec.BrokerProperties = []string{
+				"messageCounterSamplePeriod=500",
 			}
 
 			By("Deploying the CRD " + crd.ObjectMeta.Name)
@@ -163,6 +175,41 @@ var _ = Describe("minimal", func() {
 				}
 				g.Expect(meta.IsStatusConditionTrue(createdCrd.Status.Conditions, brokerv1beta1.ReadyConditionType)).Should(BeTrue())
 				g.Expect(meta.IsStatusConditionTrue(createdCrd.Status.Conditions, brokerv1beta1.ConfigAppliedConditionType)).Should(BeTrue())
+
+			}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
+
+			By("Checking metrics with mtls are visible")
+			Eventually(func(g Gomega) {
+				pod := &corev1.Pod{}
+				podName := namer.CrToSS(crd.Name) + "-0"
+				podNamespacedName := types.NamespacedName{Name: podName, Namespace: defaultNamespace}
+				g.Expect(k8sClient.Get(ctx, podNamespacedName, pod)).Should(Succeed())
+
+				g.Expect(pod.Status).ShouldNot(BeNil())
+				g.Expect(pod.Status.PodIP).ShouldNot(BeEmpty())
+
+				resp, err := http.Get("https://" + pod.Status.PodIP + ":8888/metrics")
+				if verbose {
+					fmt.Printf("Resp form metrics get resp: %v, error: %v\n", resp, err)
+				}
+				g.Expect(err).Should(Succeed())
+
+				defer resp.Body.Close()
+				body, err := io.ReadAll(resp.Body)
+				g.Expect(err).Should(Succeed())
+
+				lines := strings.Split(string(body), "\n")
+
+				var done = false
+				for _, line := range lines {
+					if verbose {
+						fmt.Printf("%s\n", line)
+					}
+					if strings.Contains(line, "artemis_total_pending_message_count") {
+						done = true
+					}
+				}
+				g.Expect(done).To(BeTrue())
 
 			}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
 

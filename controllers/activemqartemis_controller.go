@@ -892,7 +892,7 @@ func (e unknownJolokiaError) Error() string {
 }
 
 func (e unknownJolokiaError) Requeue() bool {
-	return false
+	return true
 }
 
 func NewJolokiaClientsNotFoundError(err error) jolokiaClientNotFoundError {
