@@ -2057,9 +2057,9 @@ func (reconciler *ActiveMQArtemisReconcilerImpl) PodTemplateSpecForCR(customReso
 		// jmx_exporter metrics perms
 		fmt.Fprintln(rbac, "securityRoles.\"mops.mbeanserver.queryMBeans\".metrics.view=true")
 		fmt.Fprintln(rbac, "securityRoles.\"mops.broker\".metrics.view=true") // for query remove filter
-		fmt.Fprintln(rbac, "securityRoles.\"mops.broker.getTotalMessageCount\".metrics.view=true")
-		fmt.Fprintln(rbac, "securityRoles.\"mops.broker.getTotalMessagesAcknowledged\".metrics.view=true")
-		fmt.Fprintln(rbac, "securityRoles.\"mops.broker.getTotalMessagesAdded\".metrics.view=true")
+		fmt.Fprintln(rbac, "securityRoles.\"mops.broker.#\".metrics.view=true")
+		//fmt.Fprintln(rbac, "securityRoles.\"mops.broker.getTotalMessagesAcknowledged\".metrics.view=true")
+		//fmt.Fprintln(rbac, "securityRoles.\"mops.broker.getTotalMessagesAdded\".metrics.view=true")
 
 		brokerPropertiesMapData["aa_rbac.properties"] = rbac.String()
 
@@ -2111,25 +2111,29 @@ func (reconciler *ActiveMQArtemisReconcilerImpl) PodTemplateSpecForCR(customReso
 		// the collector/scraper config
 		fmt.Fprintf(prometheus_config, "lowercaseOutputName: true\n")
 		fmt.Fprintf(prometheus_config, "lowercaseOutputLabelNames: true\n")
-		fmt.Fprintf(prometheus_config, "includeObjectNames: [org.apache.activemq.artemis:broker=\"amq-broker\"]\n")
+		fmt.Fprintf(prometheus_config, "includeObjectNames: [org.apache.activemq.artemis:broker=*]\n")
 		fmt.Fprintf(prometheus_config, "includeObjectNameAttributes:\n")
 		fmt.Fprintf(prometheus_config, "  'org.apache.activemq.artemis:broker=\"amq-broker\"':\n")
 		fmt.Fprintf(prometheus_config, "    - \"TotalMessageCount\"\n")
+		fmt.Fprintf(prometheus_config, "    - \"QueueCount\"\n")
+		fmt.Fprintf(prometheus_config, "    - \"AddressCount\"\n")
 		fmt.Fprintf(prometheus_config, "    - \"TotalMessagesAdded\"\n")
 		fmt.Fprintf(prometheus_config, "    - \"TotalMessagesAcknowledged\"\n")
 		fmt.Fprintf(prometheus_config, "rules:\n")
-		fmt.Fprintf(prometheus_config, "  - pattern: 'org.apache.activemq.artemis<broker=\"amq-broker\"><>TotalMessageCount'\n")
-		fmt.Fprintf(prometheus_config, "    help: Number of pending messages\n")
-		fmt.Fprintf(prometheus_config, "    name: artemis_total_pending_message_count\n")
-		fmt.Fprintf(prometheus_config, "    type: GAUGE\n")
-		fmt.Fprintf(prometheus_config, "  - pattern: 'org.apache.activemq.artemis<broker=\"amq-broker\"><>TotalMessagesAcknowledged'\n")
-		fmt.Fprintf(prometheus_config, "    help: Number of messages consumed since start\n")
-		fmt.Fprintf(prometheus_config, "    name: artemis_total_consumed_message_count\n")
+		fmt.Fprintf(prometheus_config, "  - pattern: 'org.apache.activemq.artemis<broker=\"amq-broker\"><>(.*)'\n")
+		//fmt.Fprintf(prometheus_config, "    help: Number of pending messages\n")
+		fmt.Fprintf(prometheus_config, "    name: artemis_$1\n")
+		fmt.Fprintf(prometheus_config, "    attrNameSnakeCase: true\n")
 		fmt.Fprintf(prometheus_config, "    type: COUNTER\n")
-		fmt.Fprintf(prometheus_config, "  - pattern: 'org.apache.activemq.artemis<broker=\"amq-broker\"><>TotalMessagesAdded'\n")
-		fmt.Fprintf(prometheus_config, "    help: Number of messages produced since start\n")
-		fmt.Fprintf(prometheus_config, "    name: artemis_total_produced_message_count\n")
-		fmt.Fprintf(prometheus_config, "    type: COUNTER\n")
+		/*
+			fmt.Fprintf(prometheus_config, "  - pattern: 'org.apache.activemq.artemis<broker=\"amq-broker\"><>TotalMessagesAcknowledged'\n")
+			fmt.Fprintf(prometheus_config, "    help: Number of messages consumed since start\n")
+			fmt.Fprintf(prometheus_config, "    name: artemis_total_consumed_message_count\n")
+			fmt.Fprintf(prometheus_config, "    type: COUNTER\n")
+			fmt.Fprintf(prometheus_config, "  - pattern: 'org.apache.activemq.artemis<broker=\"amq-broker\"><>TotalMessagesAdded'\n")
+			fmt.Fprintf(prometheus_config, "    help: Number of messages produced since start\n")
+			fmt.Fprintf(prometheus_config, "    name: artemis_total_produced_message_count\n")
+			fmt.Fprintf(prometheus_config, "    type: COUNTER\n")*/
 
 		brokerPropertiesMapData["_prometheus_exporter.yaml"] = prometheus_config.String()
 
