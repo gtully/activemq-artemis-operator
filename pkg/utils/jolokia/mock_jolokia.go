@@ -93,6 +93,14 @@ func (m *MockIJolokia) Read(path string) (*ResponseData, error) {
 	return ret0, ret1
 }
 
+func (m *MockIJolokia) Search(path string) (*ResponseData, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Search", path)
+	ret0, _ := ret[0].(*ResponseData)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
 func (m *MockIJolokia) GetProtocol() string {
 	return "http"
 }

@@ -149,6 +149,11 @@ var _ = Describe("minimal", func() {
 				{Name: "JAVA_ARGS_APPEND", Value: "-DordinalProp=${STATEFUL_SET_ORDINAL}"},
 			}
 
+			crd.Spec.BrokerProperties = []string{
+				// don't do this, you will need to supply probe that can use this name value
+				`name=John`,
+			}
+
 			By("Deploying the CRD " + crd.ObjectMeta.Name)
 			Expect(k8sClient.Create(ctx, &crd)).Should(Succeed())
 
@@ -166,6 +171,8 @@ var _ = Describe("minimal", func() {
 				g.Expect(meta.IsStatusConditionTrue(createdCrd.Status.Conditions, brokerv1beta1.ConfigAppliedConditionType)).Should(BeTrue())
 
 			}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
+
+			By("wait for probe to kill the broker")
 
 			Expect(k8sClient.Delete(ctx, createdCrd)).Should(Succeed())
 

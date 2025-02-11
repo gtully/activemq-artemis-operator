@@ -56,8 +56,26 @@ func GetArtemisAgentForRestricted(client rtclient.Client, brokerName string, ord
 		name:        brokerName,
 		jolokia:     jolokia.GetRestrictedJolokia(client, ordinalFqdn, jolokia.JOLOKIA_AGENT_PORT, "/jolokia"),
 	}
+	ExtractBrokerNameFromBrokerMbean(&artemis)
 	return &artemis
 
+}
+
+func ExtractBrokerNameFromBrokerMbean(artemis *Artemis) string {
+
+	resp, err := artemis.jolokia.Search("org.apache.activemq.artemis:broker=*")
+
+	fmt.Printf("Search resp: %v\n", resp)
+	if err == nil || resp != nil {
+		if resp.Status == 200 {
+			// extract single quoted broker key value from mbean object name json array
+			values := strings.Split(resp.Value, "\"")
+			if len(values) == 3 {
+				artemis.name = values[1]
+			}
+		}
+	}
+	return artemis.name
 }
 
 func GetArtemis(_client rtclient.Client, _ip string, _jolokiaPort string, _name string, _user string, _password string, _protocol string) *Artemis {

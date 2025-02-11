@@ -43,6 +43,7 @@ func (j *JolokiaError) Error() string {
 
 type IJolokia interface {
 	Read(path string) (*ResponseData, error)
+	Search(path string) (*ResponseData, error)
 	Exec(path, postJsonString string) (*ResponseData, error)
 	GetProtocol() string
 }
@@ -127,9 +128,17 @@ func (j *Jolokia) getClient() *http.Client {
 	return &httpClient
 }
 
-func (j *Jolokia) Read(_path string) (*ResponseData, error) {
+func (j *Jolokia) Search(_path string) (*ResponseData, error) {
+	return j.doGet("/search/" + _path)
+}
 
-	url := j.protocol + "://" + j.user + ":" + j.password + "@" + j.jolokiaURL + "/read/" + _path
+func (j *Jolokia) Read(_path string) (*ResponseData, error) {
+	return j.doGet("/read/" + _path)
+}
+
+func (j *Jolokia) doGet(_path string) (*ResponseData, error) {
+
+	url := j.protocol + "://" + j.user + ":" + j.password + "@" + j.jolokiaURL + _path
 
 	jolokiaClient := j.getClient()
 

@@ -2047,6 +2047,8 @@ func (reconciler *ActiveMQArtemisReconcilerImpl) PodTemplateSpecForCR(customReso
 
 		rbac := newPropsWithHeader()
 		fmt.Fprintln(rbac, "securityRoles.\"mops.broker.getStatus\".status.view=true")
+		fmt.Fprintln(rbac, "securityRoles.\"mops.mbeanserver.queryNames\".status.view=true")
+		fmt.Fprintln(rbac, "securityRoles.\"mops.broker\".status.view=true") // allow queryNames return the broker mbean
 
 		brokerPropertiesMapData["aa_rbac.properties"] = rbac.String()
 
