@@ -41,7 +41,7 @@ import (
 	"github.com/arkmq-org/activemq-artemis-operator/version"
 )
 
-var _ = Describe("broker-service", func() {
+var _ = Describe("broker-service-poc", func() {
 
 	var installedCertManager bool = false
 

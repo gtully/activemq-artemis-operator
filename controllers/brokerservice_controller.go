@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 
 	broker "github.com/arkmq-org/activemq-artemis-operator/api/v1beta1"
@@ -34,9 +35,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -94,24 +96,17 @@ func (reconciler *BrokerServiceReconciler) Reconcile(ctx context.Context, reques
 	reqLogger.V(2).Info("Reconciler Processing...", "CRD.Name", instance.Name, "CRD ver", instance.ObjectMeta.ResourceVersion, "CRD Gen", instance.ObjectMeta.Generation)
 
 	if err = processor.InitDeployed(instance, processor.getOwned()...); err == nil {
-		// reconcile
 		if err = processor.processSpec(); err == nil {
-			if err = processor.SyncDesiredWithDeployed(instance); err == nil {
-				// all good
-			} else {
-				reqLogger.Error(err, "failed to sync resources")
-			}
-		} else {
-			reqLogger.Error(err, "failed to process spec")
+			err = processor.SyncDesiredWithDeployed(instance)
 		}
-	} else {
-		reqLogger.Error(err, "failed to init deployed")
 	}
 
-	if statusErr := processor.processStatus(err); statusErr != nil {
-		if err == nil {
-			return ctrl.Result{}, statusErr
-		}
+	statusErr, retry := processor.processStatus(err)
+	if err == nil {
+		err = statusErr
+	}
+	if err == nil && retry {
+		return ctrl.Result{RequeueAfter: common.GetReconcileResyncPeriod()}, nil
 	}
 	return ctrl.Result{}, err
 }
@@ -133,6 +128,10 @@ func (r *BrokerServiceReconciler) getOrderedTypeList() []reflect.Type {
 }
 
 func (reconciler *BrokerServiceInstanceReconciler) processSpec() (err error) {
+	// Validate resource name for safe file path construction
+	if err = common.ValidateResourceName(reconciler.instance.Name); err != nil {
+		return fmt.Errorf("invalid resource name: %w", err)
+	}
 	if err = reconciler.processBroker(); err == nil {
 		err = reconciler.processService()
 	}
@@ -200,8 +199,22 @@ func (reconciler *BrokerServiceInstanceReconciler) processAppSecrets() (err erro
 
 	// reset data
 	desired.Data = make(map[string][]byte)
+	appIdentities := make([]string, 0, len(apps.Items))
 
 	for _, app := range apps.Items {
+		// Double-check the annotation matches (field indexer cache might be stale)
+		if currentAnnotation, ok := app.Annotations[common.AppServiceAnnotation]; !ok || currentAnnotation != serviceKey {
+			reconciler.log.V(1).Info("Skipping app with mismatched annotation (index cache stale)",
+				"app", app.Name,
+				"expected", serviceKey,
+				"actual", currentAnnotation)
+			continue
+		}
+		// Validate app name for safe file path construction
+		if err = common.ValidateResourceName(app.Name); err != nil {
+			reconciler.log.Error(err, "invalid app name", "app", app.Name)
+			break
+		}
 		if err = reconciler.processCapabilities(desired, &app); err != nil {
 			reconciler.log.Error(err, "failed to process capabilities for app", "app", app.Name)
 			break
@@ -210,7 +223,14 @@ func (reconciler *BrokerServiceInstanceReconciler) processAppSecrets() (err erro
 			reconciler.log.Error(err, "failed to process acceptor for app", "app", app.Name)
 			break
 		}
+		appIdentities = append(appIdentities, AppIdentity(&app))
 	}
+
+	sort.Strings(appIdentities)
+	if desired.Annotations == nil {
+		desired.Annotations = make(map[string]string)
+	}
+	desired.Annotations[common.ProvisionedAppsAnnotation] = strings.Join(appIdentities, ",")
 
 	reconciler.TrackDesired(desired)
 	return err
@@ -221,21 +241,29 @@ func (reconciler *BrokerServiceInstanceReconciler) appPropertiesSecretName() str
 }
 
 func AppPropertiesSecretName(name string) string {
-	return fmt.Sprintf("%s-app%s", name, BrokerPropsSuffix)
+	return fmt.Sprintf("%s-app%s", name, common.BrokerPropsSuffix)
 }
 
 func PropertiesSecretName(name string) string {
-	return fmt.Sprintf("%s%s", name, BrokerPropsSuffix)
+	return fmt.Sprintf("%s%s", name, common.BrokerPropsSuffix)
 }
 
 func certSecretName(cr *broker.BrokerService) string {
 	return fmt.Sprintf("%s-%s", cr.Name, common.DefaultOperandCertSecretName)
 }
 
-func (reconciler *BrokerServiceInstanceReconciler) processStatus(reconcilerError error) (err error) {
+func (reconciler *BrokerServiceInstanceReconciler) processStatus(reconcilerError error) (err error, retry bool) {
 
 	var deployedCondition metav1.Condition = metav1.Condition{
-		Type: broker.DeployedConditionType,
+		Type:   broker.DeployedConditionType,
+		Status: metav1.ConditionFalse,
+		Reason: "NotReady",
+	}
+
+	var appsProvisionedCondition metav1.Condition = metav1.Condition{
+		Type:   "AppsProvisioned",
+		Status: metav1.ConditionFalse,
+		Reason: "WaitingForBroker",
 	}
 
 	if reconcilerError != nil {
@@ -243,36 +271,59 @@ func (reconciler *BrokerServiceInstanceReconciler) processStatus(reconcilerError
 		deployedCondition.Reason = broker.DeployedConditionCrudKindErrorReason
 		deployedCondition.Message = fmt.Sprintf("error on resource crud %v", reconcilerError)
 	} else {
-		var ready bool = false
 		obj := reconciler.CloneOfDeployed(reflect.TypeOf(broker.ActiveMQArtemis{}), reconciler.instance.Name)
 		if obj != nil {
 			deployed := obj.(*broker.ActiveMQArtemis)
-			brokerReady := meta.FindStatusCondition(deployed.Status.Conditions, broker.ReadyConditionType)
+			brokerDeployed := meta.FindStatusCondition(deployed.Status.Conditions, broker.DeployedConditionType)
 
-			if brokerReady != nil && brokerReady.Status == metav1.ConditionTrue {
-				ready = true
-			} else {
-				deployedCondition.Message = fmt.Sprintf("not ready status %v", deployed.Status)
+			if brokerDeployed != nil {
+				if brokerDeployed.Status == metav1.ConditionTrue {
+					deployedCondition.Status = metav1.ConditionTrue
+					deployedCondition.Reason = broker.ReadyConditionReason
+				} else {
+					deployedCondition.Message = fmt.Sprintf("not ready broker status %v", deployed.Status)
+				}
 			}
-		}
 
-		if ready {
-			deployedCondition.Status = metav1.ConditionTrue
-			deployedCondition.Reason = broker.ReadyConditionReason
-		} else {
-			deployedCondition.Status = metav1.ConditionFalse
-			deployedCondition.Reason = broker.DeployedConditionNotReadyReason
+			brokerReady := meta.FindStatusCondition(deployed.Status.Conditions, broker.ReadyConditionType)
+			if brokerReady != nil && brokerReady.Status == metav1.ConditionTrue {
+
+				appPropsSecretName := AppPropertiesSecretName(reconciler.instance.Name)
+				var appliedSecretVersion string
+				for _, ec := range deployed.Status.ExternalConfigs {
+					if ec.Name == appPropsSecretName {
+						appliedSecretVersion = ec.ResourceVersion
+						break
+					}
+				}
+				if appliedSecretVersion != "" {
+					secret := &corev1.Secret{}
+					secretKey := types.NamespacedName{Name: appPropsSecretName, Namespace: reconciler.instance.Namespace}
+					if getErr := reconciler.Client.Get(context.TODO(), secretKey, secret); getErr == nil {
+						if secret.ResourceVersion == appliedSecretVersion {
+							appsProvisionedCondition.Status = metav1.ConditionTrue
+							appsProvisionedCondition.Reason = "Synced"
+							if applied, ok := secret.Annotations[common.ProvisionedAppsAnnotation]; ok && applied != "" {
+								reconciler.status.ProvisionedApps = strings.Split(applied, ",")
+							} else {
+								reconciler.status.ProvisionedApps = nil
+							}
+						}
+					}
+				}
+			}
 		}
 	}
 	meta.SetStatusCondition(&reconciler.status.Conditions, deployedCondition)
+	meta.SetStatusCondition(&reconciler.status.Conditions, appsProvisionedCondition)
 
 	common.SetReadyCondition(&reconciler.status.Conditions)
 
-	if !reflect.DeepEqual(reconciler.instance.Status, reconciler.status) {
+	if !reflect.DeepEqual(reconciler.instance.Status, *reconciler.status) {
 		reconciler.instance.Status = *reconciler.status
 		err = resources.UpdateStatus(reconciler.Client, reconciler.instance)
 	}
-	return err
+	return err, retry
 }
 
 func getPeerLabelKey(cr *broker.BrokerService) string {
@@ -309,6 +360,67 @@ func (reconciler *BrokerServiceInstanceReconciler) processService() error {
 	return nil
 }
 
+// appToServiceHandler handles BrokerApp events and enqueues the affected BrokerService(s).
+// On Update, it enqueues both the old and new service if the annotation changed.
+type appToServiceHandler struct{}
+
+func (h *appToServiceHandler) Create(ctx context.Context, evt event.CreateEvent, q workqueue.RateLimitingInterface) {
+	if req := h.getServiceRequest(evt.Object); req != nil {
+		q.Add(*req)
+	}
+}
+
+func (h *appToServiceHandler) Update(ctx context.Context, evt event.UpdateEvent, q workqueue.RateLimitingInterface) {
+	oldAnnotation, oldOk := evt.ObjectOld.GetAnnotations()[common.AppServiceAnnotation]
+	newAnnotation, newOk := evt.ObjectNew.GetAnnotations()[common.AppServiceAnnotation]
+
+	// Enqueue old service if annotation existed
+	if oldOk {
+		if req := h.getServiceRequestFromAnnotation(oldAnnotation); req != nil {
+			q.Add(*req)
+		}
+	}
+
+	// Enqueue new service if annotation exists and is different from old
+	if newOk && oldAnnotation != newAnnotation {
+		if req := h.getServiceRequestFromAnnotation(newAnnotation); req != nil {
+			q.Add(*req)
+		}
+	}
+}
+
+func (h *appToServiceHandler) Delete(ctx context.Context, evt event.DeleteEvent, q workqueue.RateLimitingInterface) {
+	if req := h.getServiceRequest(evt.Object); req != nil {
+		q.Add(*req)
+	}
+}
+
+func (h *appToServiceHandler) Generic(ctx context.Context, evt event.GenericEvent, q workqueue.RateLimitingInterface) {
+	if req := h.getServiceRequest(evt.Object); req != nil {
+		q.Add(*req)
+	}
+}
+
+func (h *appToServiceHandler) getServiceRequest(obj client.Object) *reconcile.Request {
+	if annotation, ok := obj.GetAnnotations()[common.AppServiceAnnotation]; ok {
+		return h.getServiceRequestFromAnnotation(annotation)
+	}
+	return nil
+}
+
+func (h *appToServiceHandler) getServiceRequestFromAnnotation(annotation string) *reconcile.Request {
+	namespace, name, parsed := parseServiceAnnotation(annotation)
+	if parsed {
+		return &reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Namespace: namespace,
+				Name:      name,
+			},
+		}
+	}
+	return nil
+}
+
 func (r *BrokerServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &broker.BrokerApp{}, common.AppServiceAnnotation, func(rawObj client.Object) []string {
 		app := rawObj.(*broker.BrokerApp)
@@ -324,21 +436,7 @@ func (r *BrokerServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&broker.BrokerService{}).
 		Owns(&broker.ActiveMQArtemis{}).
-		Watches(&broker.BrokerApp{}, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, a client.Object) []reconcile.Request {
-			app := a.(*broker.BrokerApp)
-			if val, ok := app.Annotations[common.AppServiceAnnotation]; ok {
-				parts := strings.Split(val, ":")
-				if len(parts) == 2 {
-					return []reconcile.Request{
-						{NamespacedName: types.NamespacedName{
-							Namespace: parts[0],
-							Name:      parts[1],
-						}},
-					}
-				}
-			}
-			return []reconcile.Request{}
-		})).
+		Watches(&broker.BrokerApp{}, &appToServiceHandler{}).
 		Complete(r)
 }
 
@@ -467,7 +565,10 @@ func (reconciler *BrokerServiceInstanceReconciler) processAcceptor(serverConfigP
 	}
 	*/
 	usersBuf := NewPropsWithHeader()
-	fmt.Fprintf(usersBuf, "%s=/.*%s.*/\n", namespacedName, app.Name)
+	// Escape app name for safe use in regex pattern to prevent regex injection
+	// The namespacedName format is namespace-name which is already validated
+	escapedAppName := common.EscapeForRegex(app.Name)
+	fmt.Fprintf(usersBuf, "%s=/.*%s.*/\n", namespacedName, escapedAppName)
 
 	certUsersCfgKey := UnderscoreAppIdentityPrefixed(app, common.GetCertUsersKey(realmName))
 	serverConfigPropertiesSecret.Data[certUsersCfgKey] = usersBuf.Bytes()
@@ -525,7 +626,7 @@ func (reconciler *BrokerServiceInstanceReconciler) processAcceptor(serverConfigP
 	fmt.Fprintf(buf, "jaasConfigs.\"%s\".modules.cert.controlFlag=required\n", realmName)
 	fmt.Fprintf(buf, "jaasConfigs.\"%s\".modules.cert.params.\"org.apache.activemq.jaas.textfiledn.role\"=%s\n", realmName, certRolesCfgKey)
 	fmt.Fprintf(buf, "jaasConfigs.\"%s\".modules.cert.params.\"org.apache.activemq.jaas.textfiledn.user\"=%s\n", realmName, certUsersCfgKey)
-	fmt.Fprintf(buf, "jaasConfigs.\"%s\".modules.cert.params.baseDir=%s%s\n", realmName, secretPathBase, AppPropertiesSecretName(reconciler.instance.Name))
+	fmt.Fprintf(buf, "jaasConfigs.\"%s\".modules.cert.params.baseDir=%s%s\n", realmName, common.SecretPathBase, AppPropertiesSecretName(reconciler.instance.Name))
 
 	serverConfigPropertiesSecret.Data[acceptorCfgKey] = buf.Bytes()
 
