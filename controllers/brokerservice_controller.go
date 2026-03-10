@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	broker "github.com/arkmq-org/activemq-artemis-operator/api/v1beta1"
+	servicemetrics "github.com/arkmq-org/activemq-artemis-operator/pkg/metrics"
 	"github.com/arkmq-org/activemq-artemis-operator/pkg/resources"
 	"github.com/arkmq-org/activemq-artemis-operator/pkg/resources/secrets"
 	"github.com/arkmq-org/activemq-artemis-operator/pkg/utils/common"
@@ -77,6 +78,8 @@ func (reconciler *BrokerServiceReconciler) Reconcile(ctx context.Context, reques
 	var err = reconciler.Client.Get(context.TODO(), request.NamespacedName, instance)
 	if err != nil {
 		if errors.IsNotFound(err) {
+			// Clean up metrics when service is deleted
+			servicemetrics.DeleteServiceMetrics(request.Name, request.Namespace)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
@@ -323,6 +326,13 @@ func (reconciler *BrokerServiceInstanceReconciler) processStatus(reconcilerError
 		reconciler.instance.Status = *reconciler.status
 		err = resources.UpdateStatus(reconciler.Client, reconciler.instance)
 	}
+
+	servicemetrics.UpdateServiceMetrics(
+		reconciler.instance.Name,
+		reconciler.instance.Namespace,
+		len(reconciler.status.ProvisionedApps),
+	)
+
 	return err, retry
 }
 

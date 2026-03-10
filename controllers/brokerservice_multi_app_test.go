@@ -1020,9 +1020,10 @@ var _ = Describe("broker-service multi-app scenarios", func() {
 			}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
 
 			By("cleanup")
-			Expect(k8sClient.Delete(ctx, &app1Consumer)).Should(Succeed())
-			Expect(k8sClient.Delete(ctx, &app2Consumer)).Should(Succeed())
-			Expect(k8sClient.Delete(ctx, &app3Producer)).Should(Succeed())
+			cascade_foreground_policy := metav1.DeletePropagationForeground
+			Expect(k8sClient.Delete(ctx, &app1Consumer, &client.DeleteOptions{PropagationPolicy: &cascade_foreground_policy})).Should(Succeed())
+			Expect(k8sClient.Delete(ctx, &app2Consumer, &client.DeleteOptions{PropagationPolicy: &cascade_foreground_policy})).Should(Succeed())
+			Expect(k8sClient.Delete(ctx, &app3Producer, &client.DeleteOptions{PropagationPolicy: &cascade_foreground_policy})).Should(Succeed())
 			Expect(k8sClient.Delete(ctx, clientPemcfgSecret)).Should(Succeed())
 			clientPemcfgSecret.Namespace = defaultNamespace
 			Expect(k8sClient.Delete(ctx, clientPemcfgSecret)).Should(Succeed())
