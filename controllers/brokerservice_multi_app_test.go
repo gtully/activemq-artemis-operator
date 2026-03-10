@@ -25,14 +25,19 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	brokerv1beta1 "github.com/arkmq-org/activemq-artemis-operator/api/v1beta1"
+	"github.com/arkmq-org/activemq-artemis-operator/pkg/resources/secrets"
 	"github.com/arkmq-org/activemq-artemis-operator/pkg/utils/common"
+	"github.com/arkmq-org/activemq-artemis-operator/version"
 )
 
 var _ = Describe("broker-service multi-app scenarios", func() {
@@ -533,6 +538,504 @@ var _ = Describe("broker-service multi-app scenarios", func() {
 			UninstallCert(appCertName, defaultNamespace)
 			UninstallCert(service1Name+"-"+common.DefaultOperandCertSecretName, defaultNamespace)
 			UninstallCert(service2Name+"-"+common.DefaultOperandCertSecretName, defaultNamespace)
+			UninstallCert(prometheusCertName, defaultNamespace)
+		})
+	})
+
+	Context("cross-namespace app provisioning", func() {
+
+		It("should provision apps from multiple namespaces on same service", func() {
+
+			if os.Getenv("USE_EXISTING_CLUSTER") != "true" {
+				return
+			}
+
+			ctx := context.Background()
+			serviceName := NextSpecResourceName()
+
+			By("ensuring other namespace exists")
+			otherNs := corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: otherNamespace,
+				},
+			}
+			err := k8sClient.Create(ctx, &otherNs)
+			if err != nil && !errors.IsAlreadyExists(err) {
+				Fail(fmt.Sprintf("Failed to create other namespace: %v", err))
+			}
+
+			By("setting up certificates")
+			certName := serviceName + "-" + common.DefaultOperandCertSecretName
+			InstallCert(certName, defaultNamespace, func(candidate *cmv1.Certificate) {
+				candidate.Spec.SecretName = certName
+				candidate.Spec.CommonName = serviceName
+				candidate.Spec.DNSNames = []string{serviceName, fmt.Sprintf("%s.%s", serviceName, defaultNamespace), fmt.Sprintf("%s.%s.svc.%s", serviceName, defaultNamespace, common.GetClusterDomain()), common.ClusterDNSWildCard(serviceName, defaultNamespace)}
+				candidate.Spec.IssuerRef = cmmetav1.ObjectReference{
+					Name: caIssuer.Name,
+					Kind: "ClusterIssuer",
+				}
+			})
+
+			prometheusCertName := common.DefaultPrometheusCertSecretName
+			InstallCert(prometheusCertName, defaultNamespace, func(candidate *cmv1.Certificate) {
+				candidate.Spec.SecretName = prometheusCertName
+				candidate.Spec.CommonName = "prometheus"
+				candidate.Spec.IssuerRef = cmmetav1.ObjectReference{
+					Name: caIssuer.Name,
+					Kind: "ClusterIssuer",
+				}
+			})
+
+			By("creating service with 2Gi memory limit")
+			service := brokerv1beta1.BrokerService{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "BrokerService",
+					APIVersion: brokerv1beta1.GroupVersion.Identifier(),
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      serviceName,
+					Namespace: defaultNamespace,
+					Labels:    map[string]string{"cross-ns": "test"},
+				},
+				Spec: brokerv1beta1.BrokerServiceSpec{
+					Resources: corev1.ResourceRequirements{
+						Limits: corev1.ResourceList{
+							corev1.ResourceMemory: resource.MustParse("2Gi"),
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, &service)).Should(Succeed())
+
+			serviceKey := types.NamespacedName{Name: serviceName, Namespace: defaultNamespace}
+			createdService := &brokerv1beta1.BrokerService{}
+
+			By("waiting for service to be ready")
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, serviceKey, createdService)).Should(Succeed())
+				g.Expect(meta.IsStatusConditionTrue(createdService.Status.Conditions, brokerv1beta1.ReadyConditionType)).Should(BeTrue())
+			}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
+
+			By("creating app in default namespace with 512Mi memory request")
+			app1Name := "app-ns-test"
+			app1Port := int32(61710)
+			app1CertName := "app1-tls-cert"
+			InstallCert(app1CertName, defaultNamespace, func(candidate *cmv1.Certificate) {
+				candidate.Spec.SecretName = app1CertName
+				candidate.Spec.CommonName = app1Name
+				candidate.Spec.IssuerRef = cmmetav1.ObjectReference{
+					Name: caIssuer.Name,
+					Kind: "ClusterIssuer",
+				}
+			})
+
+			app1 := brokerv1beta1.BrokerApp{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "BrokerApp",
+					APIVersion: brokerv1beta1.GroupVersion.Identifier(),
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      app1Name,
+					Namespace: defaultNamespace,
+				},
+				Spec: brokerv1beta1.BrokerAppSpec{
+					ServiceSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"cross-ns": "test"},
+					},
+					Acceptor: brokerv1beta1.AppAcceptorType{
+						Port: app1Port,
+					},
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceMemory: resource.MustParse("512Mi"),
+						},
+					},
+					Capabilities: []brokerv1beta1.AppCapabilityType{
+						{
+							Role: "app1-role",
+							SubscriberOf: []brokerv1beta1.AppAddressType{
+								{Address: "app1.address::queue1"},
+								{Address: "shared.address::app1-client.app1-shared-queue"},
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, &app1)).Should(Succeed())
+
+			app1Key := types.NamespacedName{Name: app1Name, Namespace: defaultNamespace}
+			createdApp1 := &brokerv1beta1.BrokerApp{}
+
+			By("waiting for app1 to be ready")
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, app1Key, createdApp1)).Should(Succeed())
+				g.Expect(meta.IsStatusConditionTrue(createdApp1.Status.Conditions, brokerv1beta1.ReadyConditionType)).Should(BeTrue())
+				if verbose {
+					fmt.Printf("App1 Ready, binding: %v\n", createdApp1.Status.Binding)
+				}
+			}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
+
+			By("creating app in other namespace with 1Gi memory request")
+			app2Name := "app-ns-other"
+			app2Port := int32(61711)
+			app2CertName := "app2-tls-cert"
+			InstallCert(app2CertName, otherNamespace, func(candidate *cmv1.Certificate) {
+				candidate.Spec.SecretName = app2CertName
+				candidate.Spec.CommonName = app2Name
+				candidate.Spec.IssuerRef = cmmetav1.ObjectReference{
+					Name: caIssuer.Name,
+					Kind: "ClusterIssuer",
+				}
+			})
+
+			app2 := brokerv1beta1.BrokerApp{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "BrokerApp",
+					APIVersion: brokerv1beta1.GroupVersion.Identifier(),
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      app2Name,
+					Namespace: otherNamespace,
+				},
+				Spec: brokerv1beta1.BrokerAppSpec{
+					ServiceSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"cross-ns": "test"},
+					},
+					Acceptor: brokerv1beta1.AppAcceptorType{
+						Port: app2Port,
+					},
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceMemory: resource.MustParse("1Gi"),
+						},
+					},
+					Capabilities: []brokerv1beta1.AppCapabilityType{
+						{
+							Role: "app2-role",
+							SubscriberOf: []brokerv1beta1.AppAddressType{
+								{Address: "app2.address::queue2"},
+								{Address: "shared.address::app2-client.app2-shared-queue"},
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, &app2)).Should(Succeed())
+
+			app2Key := types.NamespacedName{Name: app2Name, Namespace: otherNamespace}
+			createdApp2 := &brokerv1beta1.BrokerApp{}
+
+			By("waiting for app2 to be ready")
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, app2Key, createdApp2)).Should(Succeed())
+				g.Expect(meta.IsStatusConditionTrue(createdApp2.Status.Conditions, brokerv1beta1.ReadyConditionType)).Should(BeTrue())
+				if verbose {
+					fmt.Printf("App2 Ready, binding: %v\n", createdApp2.Status.Binding)
+				}
+			}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
+
+			By("verifying both apps are provisioned on the service")
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, serviceKey, createdService)).Should(Succeed())
+				if verbose {
+					fmt.Printf("Service ProvisionedApps: %v\n", createdService.Status.ProvisionedApps)
+				}
+				g.Expect(createdService.Status.ProvisionedApps).Should(HaveLen(2))
+				g.Expect(createdService.Status.ProvisionedApps).Should(ContainElement(ContainSubstring(app1Name)))
+				g.Expect(createdService.Status.ProvisionedApps).Should(ContainElement(ContainSubstring(app2Name)))
+			}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
+
+			By("verifying both apps have correct annotations")
+			expectedAnnotation := fmt.Sprintf("%s:%s", defaultNamespace, serviceName)
+
+			Expect(k8sClient.Get(ctx, app1Key, createdApp1)).Should(Succeed())
+			Expect(createdApp1.Annotations[common.AppServiceAnnotation]).Should(Equal(expectedAnnotation))
+
+			Expect(k8sClient.Get(ctx, app2Key, createdApp2)).Should(Succeed())
+			Expect(createdApp2.Annotations[common.AppServiceAnnotation]).Should(Equal(expectedAnnotation))
+
+			By("verifying capacity tracking across namespaces - third app should fail")
+			app3Name := "app-ns-test-too-big"
+			app3Port := int32(61712)
+			app3CertName := "app3-tls-cert"
+			InstallCert(app3CertName, defaultNamespace, func(candidate *cmv1.Certificate) {
+				candidate.Spec.SecretName = app3CertName
+				candidate.Spec.CommonName = app3Name
+				candidate.Spec.IssuerRef = cmmetav1.ObjectReference{
+					Name: caIssuer.Name,
+					Kind: "ClusterIssuer",
+				}
+			})
+
+			app3 := brokerv1beta1.BrokerApp{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "BrokerApp",
+					APIVersion: brokerv1beta1.GroupVersion.Identifier(),
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      app3Name,
+					Namespace: defaultNamespace,
+				},
+				Spec: brokerv1beta1.BrokerAppSpec{
+					ServiceSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"cross-ns": "test"},
+					},
+					Acceptor: brokerv1beta1.AppAcceptorType{
+						Port: app3Port,
+					},
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceMemory: resource.MustParse("1Gi"), // Total would be 2.5Gi > 2Gi limit
+						},
+					},
+					Capabilities: []brokerv1beta1.AppCapabilityType{
+						{
+							Role: "app3-role",
+							SubscriberOf: []brokerv1beta1.AppAddressType{
+								{Address: "app3.address::queue3"},
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, &app3)).Should(Succeed())
+
+			app3Key := types.NamespacedName{Name: app3Name, Namespace: defaultNamespace}
+			createdApp3 := &brokerv1beta1.BrokerApp{}
+
+			By("verifying app3 cannot be provisioned due to insufficient capacity")
+			Consistently(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, app3Key, createdApp3)).Should(Succeed())
+				// Should have Valid=False with NoServiceCapacity reason
+				validCond := meta.FindStatusCondition(createdApp3.Status.Conditions, brokerv1beta1.ValidConditionType)
+				if validCond != nil {
+					if verbose {
+						fmt.Printf("App3 Valid condition: %s, Reason: %s, Message: %s\n",
+							validCond.Status, validCond.Reason, validCond.Message)
+					}
+					g.Expect(validCond.Status).Should(Equal(metav1.ConditionFalse))
+					g.Expect(validCond.Reason).Should(Equal("NoServiceCapacity"))
+				}
+			}, "10s", "1s").Should(Succeed())
+
+			By("modifying app3 to reduce memory and add producer for shared address")
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, app3Key, createdApp3)).Should(Succeed())
+				createdApp3.Spec.Resources.Requests[corev1.ResourceMemory] = resource.MustParse("256Mi")
+				createdApp3.Spec.Capabilities = []brokerv1beta1.AppCapabilityType{
+					{
+						Role:       "app3-role",
+						ProducerOf: []brokerv1beta1.AppAddressType{{Address: "shared.address"}},
+						SubscriberOf: []brokerv1beta1.AppAddressType{
+							{Address: "app3.address::queue3"},
+						},
+					},
+				}
+				g.Expect(k8sClient.Update(ctx, createdApp3)).Should(Succeed())
+			}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
+
+			By("verifying app3 becomes ready after modification")
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, app3Key, createdApp3)).Should(Succeed())
+				g.Expect(meta.IsStatusConditionTrue(createdApp3.Status.Conditions, brokerv1beta1.ReadyConditionType)).Should(BeTrue())
+				if verbose {
+					fmt.Printf("App3 now ready, binding: %v\n", createdApp3.Status.Binding)
+				}
+			}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
+
+			By("verifying all three apps are provisioned on the service")
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, serviceKey, createdService)).Should(Succeed())
+				if verbose {
+					fmt.Printf("Service ProvisionedApps with app3: %v\n", createdService.Status.ProvisionedApps)
+				}
+				g.Expect(createdService.Status.ProvisionedApps).Should(HaveLen(3))
+			}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
+
+			By("verify an app1 and app2 client can consume a message produced by app3")
+
+			brokerImage := version.LatestKubeImage
+
+			By("provisioning pemcfg secret for client certs in both namespaces")
+			boolFalse := false
+			serviceHostEnvVar := "BROKER_SERVICE_HOST"
+			clientPemcfgSecretName := "client-cert-pemcfg"
+			clientPemcfgKey := types.NamespacedName{Name: clientPemcfgSecretName, Namespace: defaultNamespace}
+			clientPemcfgSecret := secrets.NewSecret(clientPemcfgKey, map[string][]byte{
+				"tls.pemcfg":    []byte("source.key=/app/tls/client/tls.key\nsource.cert=/app/tls/client/tls.crt"),
+				"java.security": []byte("security.provider.6=de.dentrassi.crypto.pem.PemKeyStoreProvider"),
+			}, nil)
+			Expect(k8sClient.Create(ctx, clientPemcfgSecret, &client.CreateOptions{})).Should(Succeed())
+
+			clientPemcfgSecret.Namespace = otherNamespace
+			clientPemcfgSecret.ResourceVersion = ""
+			Expect(k8sClient.Create(ctx, clientPemcfgSecret, &client.CreateOptions{})).Should(Succeed())
+
+			jobTemplate := func(name string, ns string, bindingSecretName string, appCertName string, command []string) batchv1.Job {
+				appLabels := map[string]string{"app": name}
+				return batchv1.Job{
+					TypeMeta:   metav1.TypeMeta{Kind: "Job", APIVersion: "batch/v1"},
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: appLabels},
+					Spec: batchv1.JobSpec{
+						Parallelism: common.Int32ToPtr(1),
+						Template: corev1.PodTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{Labels: appLabels},
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{
+									{
+										Name:    name,
+										Image:   brokerImage,
+										Command: command,
+										Env: []corev1.EnvVar{
+											{
+												Name:  "JDK_JAVA_OPTIONS",
+												Value: "-Djava.security.properties=/app/tls/pem/java.security",
+											},
+											{
+												Name: serviceHostEnvVar,
+												ValueFrom: &corev1.EnvVarSource{
+													SecretKeyRef: &corev1.SecretKeySelector{
+														LocalObjectReference: corev1.LocalObjectReference{
+															Name: bindingSecretName,
+														},
+														Key:      "host",
+														Optional: &boolFalse,
+													},
+												},
+											},
+										},
+										VolumeMounts: []corev1.VolumeMount{
+											{
+												Name:      "trust",
+												MountPath: "/app/tls/ca",
+											},
+											{
+												Name:      "cert",
+												MountPath: "/app/tls/client",
+											},
+											{
+												Name:      "pem",
+												MountPath: "/app/tls/pem",
+											},
+										},
+									},
+								},
+								Volumes: []corev1.Volume{
+									{
+										Name: "trust",
+										VolumeSource: corev1.VolumeSource{
+											Secret: &corev1.SecretVolumeSource{
+												SecretName: common.DefaultOperatorCASecretName,
+											},
+										},
+									},
+									{
+										Name: "cert",
+										VolumeSource: corev1.VolumeSource{
+											Secret: &corev1.SecretVolumeSource{
+												SecretName: appCertName,
+											},
+										},
+									},
+									{
+										Name: "pem",
+										VolumeSource: corev1.VolumeSource{
+											Secret: &corev1.SecretVolumeSource{
+												SecretName: clientPemcfgSecretName,
+											},
+										},
+									},
+								},
+								RestartPolicy: corev1.RestartPolicyOnFailure,
+							},
+						},
+					},
+				}
+			}
+
+			By("deploying consumers for app1 and app2 shared queues")
+			serviceUrlTemplate := fmt.Sprintf("amqps://${%s}:%%d?transport.trustStoreType=PEMCA\\&transport.trustStoreLocation=/app/tls/ca/ca.pem\\&transport.keyStoreType=PEMCFG\\&transport.keyStoreLocation=/app/tls/pem/tls.pemcfg", serviceHostEnvVar)
+
+			app1ServiceUrl := fmt.Sprintf(serviceUrlTemplate, app1Port)
+			app1Consumer := jobTemplate(
+				"app1-consumer",
+				defaultNamespace,
+				createdApp1.Status.Binding.Name,
+				app1CertName,
+				[]string{"/bin/sh", "-c", "exec java -classpath /opt/amq/lib/*:/opt/amq/lib/extra/* org.apache.activemq.artemis.cli.Artemis consumer --protocol=AMQP --url " + app1ServiceUrl + " --message-count=1 --durable --clientID=app1-client --subscriptionName=app1-shared-queue --destination topic://shared.address;"},
+			)
+			Expect(k8sClient.Create(ctx, &app1Consumer)).Should(Succeed())
+
+			app2ServiceUrl := fmt.Sprintf(serviceUrlTemplate, app2Port)
+			app2Consumer := jobTemplate(
+				"app2-consumer",
+				otherNamespace,
+				createdApp2.Status.Binding.Name,
+				app2CertName,
+				[]string{"/bin/sh", "-c", "exec java -classpath /opt/amq/lib/*:/opt/amq/lib/extra/* org.apache.activemq.artemis.cli.Artemis consumer --protocol=AMQP --url " + app2ServiceUrl + " --message-count=1 --durable --clientID=app2-client --subscriptionName=app2-shared-queue --destination topic://shared.address;"},
+			)
+			Expect(k8sClient.Create(ctx, &app2Consumer)).Should(Succeed())
+
+			By("deploying producer for app3 to send message to shared.address")
+			app3ServiceUrl := fmt.Sprintf(serviceUrlTemplate, app3Port)
+			app3Producer := jobTemplate(
+				"app3-producer",
+				defaultNamespace,
+				createdApp3.Status.Binding.Name,
+				app3CertName,
+				[]string{"/bin/sh", "-c", "exec java -classpath /opt/amq/lib/*:/opt/amq/lib/extra/* org.apache.activemq.artemis.cli.Artemis producer --protocol=AMQP --url " + app3ServiceUrl + " --message-count=1 --destination topic://shared.address;"},
+			)
+			Expect(k8sClient.Create(ctx, &app3Producer)).Should(Succeed())
+
+			By("verifying producer succeeded")
+			producerKey := types.NamespacedName{Name: app3Producer.Name, Namespace: defaultNamespace}
+			producerJob := &batchv1.Job{}
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, producerKey, producerJob)).Should(Succeed())
+				if verbose {
+					fmt.Printf("Producer job STATUS: %v\n", producerJob.Status)
+				}
+				g.Expect(producerJob.Status.Succeeded).Should(BeNumerically("==", 1))
+			}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
+
+			By("verifying both consumers received the message")
+			app1ConsumerKey := types.NamespacedName{Name: app1Consumer.Name, Namespace: defaultNamespace}
+			app1ConsumerJob := &batchv1.Job{}
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, app1ConsumerKey, app1ConsumerJob)).Should(Succeed())
+				if verbose {
+					fmt.Printf("App1 consumer job STATUS: %v\n", app1ConsumerJob.Status)
+				}
+				g.Expect(app1ConsumerJob.Status.Succeeded).Should(BeNumerically("==", 1))
+			}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
+
+			app2ConsumerKey := types.NamespacedName{Name: app2Consumer.Name, Namespace: otherNamespace}
+			app2ConsumerJob := &batchv1.Job{}
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, app2ConsumerKey, app2ConsumerJob)).Should(Succeed())
+				if verbose {
+					fmt.Printf("App2 consumer job STATUS: %v\n", app2ConsumerJob.Status)
+				}
+				g.Expect(app2ConsumerJob.Status.Succeeded).Should(BeNumerically("==", 1))
+			}, existingClusterTimeout, existingClusterInterval).Should(Succeed())
+
+			By("cleanup")
+			Expect(k8sClient.Delete(ctx, &app1Consumer)).Should(Succeed())
+			Expect(k8sClient.Delete(ctx, &app2Consumer)).Should(Succeed())
+			Expect(k8sClient.Delete(ctx, &app3Producer)).Should(Succeed())
+			Expect(k8sClient.Delete(ctx, clientPemcfgSecret)).Should(Succeed())
+			clientPemcfgSecret.Namespace = defaultNamespace
+			Expect(k8sClient.Delete(ctx, clientPemcfgSecret)).Should(Succeed())
+
+			By("cleanup")
+			Expect(k8sClient.Delete(ctx, createdApp1)).Should(Succeed())
+			Expect(k8sClient.Delete(ctx, createdApp2)).Should(Succeed())
+			Expect(k8sClient.Delete(ctx, createdApp3)).Should(Succeed())
+			Expect(k8sClient.Delete(ctx, createdService)).Should(Succeed())
+			UninstallCert(app1CertName, defaultNamespace)
+			UninstallCert(app2CertName, otherNamespace)
+			UninstallCert(app3CertName, defaultNamespace)
+			UninstallCert(certName, defaultNamespace)
 			UninstallCert(prometheusCertName, defaultNamespace)
 		})
 	})
