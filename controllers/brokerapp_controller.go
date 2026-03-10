@@ -294,9 +294,93 @@ func parseServiceAnnotation(annotation string) (namespace string, name string, o
 }
 
 func (reconciler *BrokerAppInstanceReconciler) findServiceWithCapacity(list *broker.BrokerServiceList) (chosen *broker.BrokerService, err error) {
-	// no notion of resource constraints yet
-	first := list.Items[0]
-	return &first, nil
+	if len(list.Items) == 0 {
+		return nil, fmt.Errorf("no services in list")
+	}
+
+	// Get the app's memory request (0 if not specified)
+	appMemoryRequest := reconciler.instance.Spec.Resources.Requests.Memory()
+
+	var bestService *broker.BrokerService
+	var maxAvailable int64 = -1
+
+	for i := range list.Items {
+		service := &list.Items[i]
+		available, checkErr := reconciler.getAvailableMemory(service)
+
+		if checkErr != nil {
+			reconciler.log.V(1).Info("Failed to check capacity for service",
+				"service", service.Name,
+				"error", checkErr)
+			continue
+		}
+
+		// Check if this service has enough capacity
+		if appMemoryRequest != nil && available < appMemoryRequest.Value() {
+			reconciler.log.V(1).Info("Service has insufficient memory capacity",
+				"service", service.Name,
+				"available", available,
+				"required", appMemoryRequest.Value())
+			continue
+		}
+
+		// Track service with most available capacity
+		if available > maxAvailable {
+			maxAvailable = available
+			bestService = service
+		}
+	}
+
+	if bestService == nil {
+		if appMemoryRequest != nil && !appMemoryRequest.IsZero() {
+			return nil, fmt.Errorf("no service with sufficient memory capacity (required: %s)", appMemoryRequest.String())
+		}
+		// No memory constraints, pick first
+		return &list.Items[0], nil
+	}
+
+	reconciler.log.V(1).Info("Selected service with capacity",
+		"service", bestService.Name,
+		"available-memory", maxAvailable)
+	return bestService, nil
+}
+
+func (reconciler *BrokerAppInstanceReconciler) getAvailableMemory(service *broker.BrokerService) (int64, error) {
+	// Get service's total memory limit (0 if not specified means unlimited)
+	serviceMemory := service.Spec.Resources.Limits.Memory()
+	if serviceMemory == nil || serviceMemory.IsZero() {
+		// No limit specified, treat as unlimited
+		return int64(^uint64(0) >> 1), nil // max int64
+	}
+	totalMemory := serviceMemory.Value()
+
+	// Find all apps currently provisioned on this service
+	apps := &broker.BrokerAppList{}
+	serviceKey := annotationNameFromService(service)
+	if err := reconciler.Client.List(context.TODO(), apps, client.MatchingFields{common.AppServiceAnnotation: serviceKey}); err != nil {
+		return 0, err
+	}
+
+	// Sum up memory requests of all provisioned apps
+	var usedMemory int64 = 0
+	for _, app := range apps.Items {
+		// Skip ourselves if we're already in the list
+		if app.Namespace == reconciler.instance.Namespace && app.Name == reconciler.instance.Name {
+			continue
+		}
+
+		appMemory := app.Spec.Resources.Requests.Memory()
+		if appMemory != nil {
+			usedMemory += appMemory.Value()
+		}
+	}
+
+	available := totalMemory - usedMemory
+	if available < 0 {
+		available = 0
+	}
+
+	return available, nil
 }
 
 func (reconciler *BrokerAppInstanceReconciler) verifyCapabilityAddressType() (err error) {
