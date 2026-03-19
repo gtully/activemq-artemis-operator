@@ -236,6 +236,12 @@ func (reconciler *BrokerServiceInstanceReconciler) processAppSecrets() (err erro
 	desired.Annotations[common.ProvisionedAppsAnnotation] = strings.Join(appIdentities, ",")
 
 	reconciler.TrackDesired(desired)
+
+	// Update prometheus config in control-plane-override secret with queue-level metrics
+	if err == nil {
+		err = reconciler.processControlPlaneOverrideSecret(apps)
+	}
+
 	return err
 }
 
@@ -529,6 +535,17 @@ func (reconciler *BrokerServiceInstanceReconciler) processCapabilities(secret *c
 		for _, role := range addr.consumerRoles {
 			props[fmt.Sprintf("securityRoles.\"%s\".\"%s\".consume=true\n", addressName, consumerRole(role))] = ""
 		}
+
+		// metrics
+		for _, rbacRole := range []string{"metrics", metricsRole(AppIdentity(app))} {
+			// mbean server query
+			props[fmt.Sprintf("securityRoles.\"mops.queue.%s\".%s.view=true\n", addressName, rbacRole)] = ""
+
+			// attributes
+			props[fmt.Sprintf("securityRoles.\"mops.queue.%s.getMessageCount\".%s.view=true\n", addressName, rbacRole)] = ""
+			props[fmt.Sprintf("securityRoles.\"mops.queue.%s.getConsumerCount\".%s.view=true\n", addressName, rbacRole)] = ""
+			props[fmt.Sprintf("securityRoles.\"mops.queue.%s.getDeliveringCount\".%s.view=true\n", addressName, rbacRole)] = ""
+		}
 	}
 
 	buf := NewPropsWithHeader()
@@ -688,6 +705,10 @@ func consumerRole(prefix string) string {
 	return fmt.Sprintf("%s-consumer", prefix)
 }
 
+func metricsRole(prefix string) string {
+	return fmt.Sprintf("%s-metrics", prefix)
+}
+
 func AppIdentity(app *broker.BrokerApp) string {
 	return NameSpacedValue(app, app.Name)
 }
@@ -706,4 +727,123 @@ func NameSpacedValue(app *broker.BrokerApp, v string) string {
 
 func DashPrefixValue(prefix, value string) string {
 	return fmt.Sprintf("%s-%s", prefix, value)
+}
+
+func (reconciler *BrokerServiceInstanceReconciler) controlPlaneOverrideSecretName() string {
+	return reconciler.instance.Name + "-control-plane-override"
+}
+
+func (reconciler *BrokerServiceInstanceReconciler) processControlPlaneOverrideSecret(apps *broker.BrokerAppList) error {
+	// Collect all unique ConsumerOf addresses from apps
+	consumerAddresses := make(map[string]bool)
+	for _, app := range apps.Items {
+		for _, capability := range app.Spec.Capabilities {
+			for _, address := range capability.ConsumerOf {
+				consumerAddresses[address.Address] = true
+			}
+		}
+	}
+
+	// Get or create the control-plane-override secret
+	resourceName := types.NamespacedName{
+		Namespace: reconciler.instance.Namespace,
+		Name:      reconciler.controlPlaneOverrideSecretName(),
+	}
+
+	var desired *corev1.Secret
+	obj := reconciler.CloneOfDeployed(reflect.TypeOf(corev1.Secret{}), resourceName.Name)
+	if obj != nil {
+		desired = obj.(*corev1.Secret)
+	} else {
+		desired = secrets.NewSecret(resourceName, nil, nil)
+	}
+
+	if desired.Data == nil {
+		desired.Data = make(map[string][]byte)
+	}
+
+	// Generate prometheus exporter yaml with queue-level metrics
+	prometheusConfig := reconciler.generatePrometheusConfig(consumerAddresses)
+	desired.Data["_prometheus_exporter.yaml"] = prometheusConfig
+
+	reconciler.TrackDesired(desired)
+	return nil
+}
+
+func (reconciler *BrokerServiceInstanceReconciler) generatePrometheusConfig(consumerAddresses map[string]bool) []byte {
+	buf := NewPropsWithHeader() // yaml
+
+	// HTTP server config with mTLS
+	var caSecret string
+	var caSecretKey string
+	if caCertSecret, err := common.GetOperatorCASecret(reconciler.Client); err == nil {
+		caSecret = caCertSecret.Name
+		if key, err := common.GetOperatorCASecretKey(reconciler.Client, caCertSecret); err == nil {
+			caSecretKey = key
+		}
+	}
+
+	// Broker reconciler creates broker properties secret with "-props" suffix
+	brokerPropsSecretName := reconciler.instance.Name + "-props"
+	mountPathRoot := fmt.Sprintf("%s%s", common.SecretPathBase, brokerPropsSecretName)
+
+	fmt.Fprintf(buf, "httpServer:\n")
+	fmt.Fprintf(buf, "  authentication:\n")
+	fmt.Fprintf(buf, "    plugin:\n")
+	fmt.Fprintf(buf, "      class: org.apache.activemq.artemis.spi.core.security.jaas.HttpServerAuthenticator\n")
+	fmt.Fprintf(buf, "      subjectAttributeName: org.jolokia.jaasSubject\n")
+	fmt.Fprintf(buf, "  ssl:\n")
+	fmt.Fprintf(buf, "    mutualTLS: true\n")
+	fmt.Fprintf(buf, "    keyStore:\n")
+	fmt.Fprintf(buf, "      filename: %s/_cert.pemcfg\n", mountPathRoot)
+	fmt.Fprintf(buf, "      type: PEMCFG\n")
+	fmt.Fprintf(buf, "    trustStore:\n")
+	fmt.Fprintf(buf, "      filename: %s%s/%s\n", common.SecretPathBase, caSecret, caSecretKey)
+	fmt.Fprintf(buf, "      type: PEMCA\n")
+	fmt.Fprintf(buf, "    certificate:\n")
+	fmt.Fprintf(buf, "      alias: alias\n")
+
+	// Collector/scraper config
+
+	fmt.Fprintf(buf, "attrNameSnakeCase: true\n")
+
+	// just queues, rbac will limit values returned
+	fmt.Fprintf(buf, "includeObjectNames:\n")
+	fmt.Fprintf(buf, "  - \"org.apache.activemq.artemis:broker=*,component=addresses,address=*,subcomponent=queues,routing-type=*,queue=*\"\n")
+
+	brokerName := reconciler.instance.Name // Use service name as broker name for restricted mode
+
+	// Add queue-level attributes for specific queues with exact ObjectNames (include quotes) for canonocial string match, this restricts the attribute load
+	if len(consumerAddresses) > 0 {
+		fmt.Fprintf(buf, "includeObjectNameAttributes:\n")
+		for address := range consumerAddresses {
+			fqqn := strings.SplitN(address, "::", 2)
+			if len(fqqn) > 1 {
+				fmt.Fprintf(buf, "  org.apache.activemq.artemis:broker=\"%s\",component=addresses,address=\"%s\",subcomponent=queues,routing-type=\"multicast\",queue=\"%s\":\n",
+					brokerName, fqqn[0], fqqn[1])
+			} else {
+				fmt.Fprintf(buf, "  org.apache.activemq.artemis:broker=\"%s\",component=addresses,address=\"%s\",subcomponent=queues,routing-type=\"anycast\",queue=\"%s\":\n",
+					brokerName, address, address)
+			}
+			fmt.Fprintf(buf, "    - MessageCount\n")
+			fmt.Fprintf(buf, "    - ConsumerCount\n")
+			fmt.Fprintf(buf, "    - DeliveringCount\n")
+		}
+	}
+
+	// regex for matchName='org.apache.activemq.artemis<broker="brokerservice617a", component=addresses, address="METRICS.QUEUE.TWO", subcomponent=queues, routing-type="anycast", queue="METRICS.QUEUE.TWO"><>MessageCount: 0'
+	// Rules for queue metrics generation
+	fmt.Fprintf(buf, "rules:\n")
+	fmt.Fprintf(buf, `  - pattern: "org.apache.activemq.artemis<broker=\"([^\"]+)\", component=addresses, address=\"([^\"]+)\", subcomponent=queues, routing-type=\"([^\"]+)\", queue=\"([^\"]+)\"><>([^:]+):"`+"\n")
+	fmt.Fprintf(buf, "    name: broker_queue_$5\n")
+	fmt.Fprintf(buf, "    help: $5\n") // non descriptive help - default contains too much unrelated info (TODO: potentially clean up and extract the help info, could have a rule per attribute)
+	fmt.Fprintf(buf, "    attrNameSnakeCase: true\n")
+	fmt.Fprintf(buf, "    type: GAUGE\n")
+	fmt.Fprintf(buf, "    labels:\n")
+	fmt.Fprintf(buf, "      broker: \"$1\"\n")
+	fmt.Fprintf(buf, "      address: \"$2\"\n")
+	fmt.Fprintf(buf, "      routing_type: \"$3\"\n")
+	fmt.Fprintf(buf, "      queue: \"$4\"\n")
+
+	return buf.Bytes()
 }

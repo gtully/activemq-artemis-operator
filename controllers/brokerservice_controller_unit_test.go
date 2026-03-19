@@ -771,3 +771,187 @@ func TestBrokerServiceReconcileAppsProvisionedCondition(t *testing.T) {
 	assert.Equal(t, metav1.ConditionTrue, cond.Status)
 	assert.Equal(t, "Synced", cond.Reason)
 }
+
+func TestBrokerServiceReconcilePrometheusOverrideSecret(t *testing.T) {
+	// Setup scheme
+	scheme := runtime.NewScheme()
+	_ = v1beta1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	// Data
+	ns := "default"
+	svcName := "my-service"
+	appName := "metrics-app"
+
+	common.SetOperatorCASecretName("op_ca")
+	t.Cleanup(common.UnsetOperatorCASecretName)
+
+	common.SetOperatorNameSpace(ns)
+	t.Cleanup(common.UnsetOperatorNameSpace)
+
+	oc := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "op_ca",
+			Namespace: ns,
+		},
+		Data: map[string][]byte{"ca.pem": []byte("bla")},
+	}
+
+	// BrokerService
+	svc := &v1beta1.BrokerService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      svcName,
+			Namespace: ns,
+		},
+		Spec: v1beta1.BrokerServiceSpec{
+			Image: StringToPtr("placeholder"),
+		},
+	}
+
+	// BrokerApp with ConsumerOf queues
+	app := &v1beta1.BrokerApp{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      appName,
+			Namespace: ns,
+			Annotations: map[string]string{
+				common.AppServiceAnnotation: fmt.Sprintf("%s:%s", ns, svcName),
+			},
+		},
+		Spec: v1beta1.BrokerAppSpec{
+			Acceptor: v1beta1.AppAcceptorType{Port: 61616},
+			Capabilities: []v1beta1.AppCapabilityType{
+				{
+					Role: "testRole",
+					ConsumerOf: []v1beta1.AppAddressType{
+						{Address: "TEST.QUEUE.ONE"},
+						{Address: "TEST.QUEUE.TWO"},
+					},
+					ProducerOf: []v1beta1.AppAddressType{
+						{Address: "TEST.QUEUE.ONE"},
+					},
+				},
+			},
+		},
+	}
+
+	// Setup fake client
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(oc, svc, app).
+		WithStatusSubresource(svc, &v1beta1.ActiveMQArtemis{}).
+		WithIndex(&v1beta1.BrokerApp{}, common.AppServiceAnnotation, func(rawObj client.Object) []string {
+			app := rawObj.(*v1beta1.BrokerApp)
+			val, ok := app.Annotations[common.AppServiceAnnotation]
+			if !ok {
+				return nil
+			}
+			return []string{val}
+		}).Build()
+
+	// Create Reconciler
+	r := NewBrokerServiceReconciler(cl, scheme, nil, logr.New(log.NullLogSink{}))
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: svcName, Namespace: ns}}
+
+	// Reconcile
+	_, err := r.Reconcile(context.TODO(), req)
+	assert.NoError(t, err)
+
+	// Verify control-plane-override secret exists
+	overrideSecretName := svcName + "-control-plane-override"
+	overrideSecret := &corev1.Secret{}
+	err = cl.Get(context.TODO(), types.NamespacedName{Name: overrideSecretName, Namespace: ns}, overrideSecret)
+	assert.NoError(t, err, "control-plane-override secret should exist")
+
+	// Verify prometheus config exists in the secret
+	prometheusYaml, ok := overrideSecret.Data["_prometheus_exporter.yaml"]
+	assert.True(t, ok, "should have _prometheus_exporter.yaml key")
+	assert.NotEmpty(t, prometheusYaml)
+
+	prometheusConfig := string(prometheusYaml)
+
+	// Verify it includes queue-level object names
+	assert.Contains(t, prometheusConfig, "org.apache.activemq.artemis:broker=*,component=addresses,address=*,subcomponent=queues,routing-type=*,queue=*")
+
+	// Verify it includes specific queues from ConsumerOf
+	assert.Contains(t, prometheusConfig, "TEST.QUEUE.ONE")
+	assert.Contains(t, prometheusConfig, "TEST.QUEUE.TWO")
+
+	// Verify it includes queue-level attributes
+	assert.Contains(t, prometheusConfig, "MessageCount")
+	assert.Contains(t, prometheusConfig, "ConsumerCount")
+	assert.Contains(t, prometheusConfig, "DeliveringCount")
+}
+
+func TestBrokerServiceReconcilePrometheusOverrideNoApps(t *testing.T) {
+	// Setup scheme
+	scheme := runtime.NewScheme()
+	_ = v1beta1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+
+	// Data
+	ns := "default"
+	svcName := "my-service"
+
+	common.SetOperatorCASecretName("op_ca")
+	t.Cleanup(common.UnsetOperatorCASecretName)
+
+	common.SetOperatorNameSpace(ns)
+	t.Cleanup(common.UnsetOperatorNameSpace)
+
+	oc := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "op_ca",
+			Namespace: ns,
+		},
+		Data: map[string][]byte{"ca.pem": []byte("bla")},
+	}
+
+	// BrokerService (no apps)
+	svc := &v1beta1.BrokerService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      svcName,
+			Namespace: ns,
+		},
+		Spec: v1beta1.BrokerServiceSpec{
+			Image: StringToPtr("placeholder"),
+		},
+	}
+
+	// Setup fake client
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(oc, svc).
+		WithStatusSubresource(svc, &v1beta1.ActiveMQArtemis{}).
+		WithIndex(&v1beta1.BrokerApp{}, common.AppServiceAnnotation, func(rawObj client.Object) []string {
+			app := rawObj.(*v1beta1.BrokerApp)
+			val, ok := app.Annotations[common.AppServiceAnnotation]
+			if !ok {
+				return nil
+			}
+			return []string{val}
+		}).Build()
+
+	// Create Reconciler
+	r := NewBrokerServiceReconciler(cl, scheme, nil, logr.New(log.NullLogSink{}))
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: svcName, Namespace: ns}}
+
+	// Reconcile
+	_, err := r.Reconcile(context.TODO(), req)
+	assert.NoError(t, err)
+
+	// Verify control-plane-override secret exists
+	overrideSecretName := svcName + "-control-plane-override"
+	overrideSecret := &corev1.Secret{}
+	err = cl.Get(context.TODO(), types.NamespacedName{Name: overrideSecretName, Namespace: ns}, overrideSecret)
+	assert.NoError(t, err, "control-plane-override secret should exist even without apps")
+
+	// Verify prometheus config exists with queue-level metrics
+	prometheusYaml, ok := overrideSecret.Data["_prometheus_exporter.yaml"]
+	assert.True(t, ok, "should have _prometheus_exporter.yaml key")
+	assert.NotEmpty(t, prometheusYaml)
+
+	prometheusConfig := string(prometheusYaml)
+
+	// Should have queue-level object names even without apps
+	assert.Contains(t, prometheusConfig, "component=addresses,address=*,subcomponent=queues")
+}
